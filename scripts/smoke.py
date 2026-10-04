@@ -59,6 +59,50 @@ def feasible_payload() -> dict:
     }
 
 
+def thermal_feasible_payload() -> tuple[dict, int]:
+    """热补偿冒烟实例：逐段总应变被紧窗钉为 8，机械界 [-3,3]，系数全 1。
+
+    m_i + τ = 8 且 m_i∈[-3,3] ⇒ τ∈[5,11]；三级最优取恒定机械序列（M=S=0）
+    中字典序最小的 m=-3，对应 τ=11。返回 (payload, 期望温变)。
+    """
+    lengths = [2, 3, 1, 4, 2, 3]
+    windows = [
+        {
+            "start_segment": 1,
+            "end_segment": 6,
+            "min_elongation": sum(lengths) * 8,
+            "max_elongation": sum(lengths) * 8,
+        }
+    ]
+    for i in range(1, 7):
+        windows.append(
+            {
+                "start_segment": i,
+                "end_segment": i,
+                "min_elongation": lengths[i - 1] * 8,
+                "max_elongation": lengths[i - 1] * 8,
+            }
+        )
+    windows.append(
+        {
+            "start_segment": 2,
+            "end_segment": 4,
+            "min_elongation": sum(lengths[1:4]) * 8,
+            "max_elongation": sum(lengths[1:4]) * 8,
+        }
+    )
+    payload = {
+        "segment_lengths": lengths,
+        "strain_bounds": {"min": -3, "max": 3},
+        "windows": windows,
+        "thermal_compensation": {
+            "coefficients": [1] * 6,
+            "temperature_delta_bounds": {"min": 0, "max": 20},
+        },
+    }
+    return payload, 11
+
+
 def main() -> None:
     print(f"smoke against {BASE}")
 
@@ -106,6 +150,97 @@ def main() -> None:
     check(
         result["objectives"]["sum_adjacent_abs_diff"] == sum(abs(d) for d in diffs),
         "二级指标 sum_adjacent_abs_diff 可由相邻差复核",
+    )
+    check(
+        "thermal_compensation" not in result,
+        "旧模式响应不包含 thermal_compensation 字段",
+    )
+
+    print("2b) thermal compensation + 机械/热分项回算")
+    payload_t, expected_tau = thermal_feasible_payload()
+    status, body = request("POST", "/api/v1/invert", payload_t)
+    check(status == 200, f"热补偿反演 -> 200 (got {status}: {body})")
+    check(body.get("code") == "OK", "热补偿响应 code == OK")
+    result = body["result"]
+    lengths = payload_t["segment_lengths"]
+    coeffs = payload_t["thermal_compensation"]["coefficients"]
+    tau = result["thermal_compensation"]["temperature_delta"]
+    ms = result["strains"]
+    t_bounds = payload_t["thermal_compensation"]["temperature_delta_bounds"]
+    check(
+        t_bounds["min"] <= tau <= t_bounds["max"],
+        f"所选温变 {tau} 落在提交闭区间 [{t_bounds['min']},{t_bounds['max']}]",
+    )
+    for check_item, win in zip(result["window_checks"], payload_t["windows"]):
+        s = win["start_segment"] - 1
+        e = win["end_segment"] - 1
+        mech = sum(lengths[i] * ms[i] for i in range(s, e + 1))
+        therm = tau * sum(lengths[i] * coeffs[i] for i in range(s, e + 1))
+        check(
+            check_item["mechanical_contribution"] == mech,
+            f"热模式窗[{win['start_segment']},{win['end_segment']}] 机械贡献 {mech} 可复算",
+        )
+        check(
+            check_item["thermal_contribution"] == therm,
+            f"热模式窗[{win['start_segment']},{win['end_segment']}] 热贡献 {therm} 可复算",
+        )
+        check(
+            check_item["weighted_strain_sum"] == mech + therm,
+            f"热模式窗[{win['start_segment']},{win['end_segment']}] 总和 = 机械+热",
+        )
+        check(
+            win["min_elongation"] <= mech + therm <= win["max_elongation"],
+            f"热模式窗[{win['start_segment']},{win['end_segment']}] 总和落入提交闭区间",
+        )
+    tc = result["thermal_compensation"]
+    check(tc["temperature_delta"] == expected_tau, f"联合三级最优温变 == {expected_tau}")
+    check(
+        tc["thermal_strains"] == [tau * c for c in coeffs],
+        "逐段热应变 = 温变 × 系数，可凭提交数据复算",
+    )
+    check(
+        tc["total_strains"] == [ms[i] + tau * coeffs[i] for i in range(len(ms))],
+        "逐段总应变 = 机械应变 + 热应变",
+    )
+    mech_diffs = [ms[i] - ms[i - 1] for i in range(1, len(ms))]
+    check(
+        result["adjacent_diffs"] == mech_diffs,
+        "平滑指标只由机械应变相邻差复核（机械未吸收共同热胀）",
+    )
+    check(
+        result["objectives"]["max_adjacent_diff"] == max(abs(d) for d in mech_diffs),
+        "热模式一级指标可由机械相邻差复核",
+    )
+    check(
+        all(payload_t["strain_bounds"]["min"] <= v <= payload_t["strain_bounds"]["max"]
+            for v in ms),
+        "每段机械应变均落入统一应变闭区间",
+    )
+
+    print("2c) thermal: 无联合解释 -> INFEASIBLE")
+    bad_t = dict(payload_t)
+    bad_t["thermal_compensation"] = {
+        "coefficients": coeffs,
+        "temperature_delta_bounds": {"min": expected_tau + 5, "max": expected_tau + 10},
+    }
+    status, body = request("POST", "/api/v1/invert", bad_t)
+    check(status == 409, f"温变区间排除全部解释 -> 409 (got {status})")
+    check(body.get("code") == "INFEASIBLE", "错误码 == INFEASIBLE")
+
+    print("2d) thermal: 字段错误 -> 422")
+    bad_t = dict(payload_t)
+    bad_t["thermal_compensation"] = {
+        "coefficients": coeffs[:-1],  # 系数数量与段数不符
+        "temperature_delta_bounds": {"min": 0, "max": 21},  # 跨度非法
+    }
+    status, body = request("POST", "/api/v1/invert", bad_t)
+    check(status == 422, f"热补偿非法输入 -> 422 (got {status})")
+    check(body.get("code") == "INVALID_INPUT", "错误码 == INVALID_INPUT")
+    paths = {f["field"] for f in body.get("fields", [])}
+    check("thermal_compensation.coefficients" in paths, "指出系数数量不符")
+    check(
+        "thermal_compensation.temperature_delta_bounds" in paths,
+        "指出温变区间跨度非法",
     )
 
     print("3) conflicting windows -> INFEASIBLE")

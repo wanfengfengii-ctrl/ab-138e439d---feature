@@ -96,3 +96,70 @@ def test_bad_json_400():
     )
     assert resp.status_code == 400
     assert resp.json()["code"] == "INVALID_INPUT"
+
+
+def _thermal_payload(t_min=0, t_max=20):
+    """每段总应变钉为 8、机械界 [-3,3]、c_i=1；需 ΔT∈[5,11]，最优 m=-3, ΔT=11。"""
+    lengths = [2, 3, 1, 4, 2, 3]
+    windows = [
+        {"start_segment": 1, "end_segment": 6,
+         "min_elongation": sum(lengths) * 8, "max_elongation": sum(lengths) * 8}
+    ]
+    windows += [
+        {"start_segment": i, "end_segment": i,
+         "min_elongation": lengths[i - 1] * 8, "max_elongation": lengths[i - 1] * 8}
+        for i in range(1, 7)
+    ]
+    windows += [
+        {"start_segment": 2, "end_segment": 4,
+         "min_elongation": sum(lengths[1:4]) * 8,
+         "max_elongation": sum(lengths[1:4]) * 8}
+    ]
+    return {
+        "segment_lengths": lengths,
+        "strain_bounds": {"min": -3, "max": 3},
+        "windows": windows,
+        "thermal_compensation": {
+            "coefficients": [1] * 6,
+            "temperature_delta_bounds": {"min": t_min, "max": t_max},
+        },
+    }
+
+
+def test_invert_thermal_success_and_recompute():
+    payload = _thermal_payload()
+    resp = client.post("/api/v1/invert", json=payload)
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["result"]
+    assert result["strains"] == [-3] * 6
+    tc = result["thermal_compensation"]
+    assert tc["temperature_delta"] == 11
+    assert tc["thermal_strains"] == [11] * 6
+    assert tc["total_strains"] == [8] * 6
+    lengths = payload["segment_lengths"]
+    coeffs = payload["thermal_compensation"]["coefficients"]
+    for check, win in zip(result["window_checks"], payload["windows"]):
+        s, e = win["start_segment"] - 1, win["end_segment"] - 1
+        mech = sum(lengths[i] * result["strains"][i] for i in range(s, e + 1))
+        therm = 11 * sum(lengths[i] * coeffs[i] for i in range(s, e + 1))
+        assert check["mechanical_contribution"] == mech
+        assert check["thermal_contribution"] == therm
+        assert check["weighted_strain_sum"] == mech + therm
+        assert check["satisfied"] is True
+
+
+def test_invert_thermal_no_joint_explanation_409():
+    resp = client.post("/api/v1/invert", json=_thermal_payload(0, 2))
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "INFEASIBLE"
+
+
+def test_invert_thermal_invalid_fields_422():
+    payload = _thermal_payload()
+    payload["thermal_compensation"]["coefficients"] = [1] * 5  # 数量不符
+    payload["thermal_compensation"]["temperature_delta_bounds"] = {"min": 0, "max": 21}
+    resp = client.post("/api/v1/invert", json=payload)
+    assert resp.status_code == 422
+    paths = {f["field"] for f in resp.json()["fields"]}
+    assert "thermal_compensation.coefficients" in paths
+    assert "thermal_compensation.temperature_delta_bounds" in paths
