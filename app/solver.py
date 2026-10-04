@@ -5,12 +5,23 @@
 - 6..12 段按顺序排列的缆段长度（正整数）
 - 统一应变闭区间 [strain_min, strain_max]（整数微应变）
 - 8..20 个观测窗，每窗给出连续起止段（1 基，含端点）与累计伸长量闭区间
+- 可选 thermal_compensation：逐段非负整数热系数 c_i 与共同整数温变闭区间
+  [t_min, t_max]（跨度不超过 20）
 
 模型（所有比较与运算均为 Python 任意精度精确整数）
 --------------------------------------------------
-待求逐段应变为 x_0..x_{n-1}（整数微应变）。
+待求逐段**机械**应变为 x_0..x_{n-1}（整数微应变）。
 
-观测窗 [s,e] 约束：Σ_{i=s..e} L_i·x_i ∈ [lo, hi]。
+无热补偿时观测窗 [s,e] 约束：Σ_{i=s..e} L_i·x_i ∈ [lo, hi]。
+启用热补偿后另引入共同温变 t ∈ [t_min, t_max]，每段观测总应变为
+x_i + c_i·t，观测窗约束变为
+
+    Σ_{i=s..e} L_i·x_i ∈ [lo - t·C_w, hi - t·C_w]，
+    C_w = Σ_{i=s..e} L_i·c_i
+
+即对每个候选 t 把窗界整体平移 -t·C_w；统一应变界与三级平滑指标始终
+**只约束机械应变 x**，热胀不被机械应变重复吸收。
+
 每段还须满足 strain_min ≤ x_i ≤ strain_max。
 
 引入前缀和 P_0=0, P_i = Σ_{j<i} L_j·x_j，则
@@ -23,12 +34,14 @@
       x_i ≥ ceil( D[i][i+1] / L_i )
       x_i ≤ floor( -D[i+1][i] / L_i )
 
-优选准则（字典序三级，逐级不可放宽）
+优选准则（字典序三级，逐级不可放宽；均只针对机械应变 x）
 1. 最小化相邻段最大应变差 M = max_k |x_k - x_{k-1}|
    —— 在 x 空间就是差分约束 x_k - x_{k-1} ∈ [-M, M]，同样并入最长路闭包。
 2. 在 1 的最优解中最小化 S = Σ_k |x_k - x_{k-1}|
    —— 辅助变量 e_k ≥ |Δ_k|，以 Σ e_k ≤ S 的线性松弛精确等价判定。
 3. 在 1、2 的最优解中取应变序列 (x_0,...,x_{n-1}) 字典序最小者。
+启用热补偿时，先在每个候选共同温变 t 内取得上述三级最优机械序列，再在
+全部允许温变间联合取 (M, S, x, t) 字典序最优——三级完全相同时取较小温变。
 
 求解：最长路闭包缩域 + 通用整数界传播 + MRV/折半回溯；
 最小 M、最小 S 及字典序各值均以「可行性关于阈值单调」二分得到。
@@ -42,6 +55,7 @@ MIN_SEGMENTS = 6
 MAX_SEGMENTS = 12
 MIN_WINDOWS = 8
 MAX_WINDOWS = 20
+MAX_TEMPERATURE_SPAN = 20
 
 
 class ValidationErrors(ValueError):
@@ -60,8 +74,15 @@ class InfeasibleError(ValueError):
 class Window:
     start: int  # 0 基，含端点
     end: int  # 0 基，含端点
-    lo: int  # 累计伸长量（长度加权应变和）闭区间下端
+    lo: int  # 累计伸长量（长度加权总应变和）闭区间下端
     hi: int  # 闭区间上端
+
+
+@dataclass(frozen=True)
+class ThermalCompensation:
+    coefficients: tuple[int, ...]  # 逐段非负整数热系数 c_i
+    t_min: int  # 共同整数温变闭区间下端
+    t_max: int  # 上端（t_max - t_min <= MAX_TEMPERATURE_SPAN）
 
 
 # --------------------------------------------------------------------------- #
@@ -195,10 +216,116 @@ def _validate_windows(
     return windows if all_ok else None
 
 
-_ALLOWED_TOP_LEVEL = {"segment_lengths", "strain_bounds", "windows"}
+_ALLOWED_TOP_LEVEL = {"segment_lengths", "strain_bounds", "windows", "thermal_compensation"}
 
 
-def validate(payload: object) -> tuple[list[int], int, int, list[Window]]:
+def _validate_thermal(
+    payload: dict, n: int | None, fields: list[dict[str, str]]
+) -> ThermalCompensation | None:
+    """校验可选 thermal_compensation；省略时返回 None（保持旧语义）。"""
+    raw = payload.get("thermal_compensation")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _err(
+            fields,
+            "thermal_compensation",
+            'must be an object {"coefficients": [non-negative int], '
+            '"temperature_delta_bounds": {"min": int, "max": int}}',
+        )
+        return None
+    for key in raw:
+        if key not in ("coefficients", "temperature_delta_bounds"):
+            _err(fields, f"thermal_compensation.{key}", "unknown field")
+    coeff_ok = True
+    coefficients: tuple[int, ...] | None = None
+    coeff_raw = raw.get("coefficients")
+    if coeff_raw is None:
+        _err(fields, "thermal_compensation.coefficients", "field is required")
+        coeff_ok = False
+    elif not isinstance(coeff_raw, list):
+        _err(
+            fields,
+            "thermal_compensation.coefficients",
+            "must be an array of non-negative integers",
+        )
+        coeff_ok = False
+    else:
+        values: list[int] = []
+        for i, item in enumerate(coeff_raw):
+            if not _is_int(item) or item < 0:
+                _err(
+                    fields,
+                    f"thermal_compensation.coefficients[{i}]",
+                    "must be a non-negative integer",
+                )
+                coeff_ok = False
+            else:
+                values.append(item)
+        if n is not None and len(coeff_raw) != n:
+            _err(
+                fields,
+                "thermal_compensation.coefficients",
+                f"must contain exactly {n} coefficients, one per segment"
+                f" (got {len(coeff_raw)})",
+            )
+            coeff_ok = False
+        coefficients = tuple(values) if coeff_ok else None
+
+    t_lo = t_hi = None
+    bounds_ok = True
+    bounds_raw = raw.get("temperature_delta_bounds")
+    if bounds_raw is None:
+        _err(fields, "thermal_compensation.temperature_delta_bounds", "field is required")
+        bounds_ok = False
+    elif not isinstance(bounds_raw, dict):
+        _err(
+            fields,
+            "thermal_compensation.temperature_delta_bounds",
+            'must be an object {"min": int, "max": int}',
+        )
+        bounds_ok = False
+    else:
+        for key in bounds_raw:
+            if key not in ("min", "max"):
+                _err(
+                    fields,
+                    f"thermal_compensation.temperature_delta_bounds.{key}",
+                    "unknown field",
+                )
+                bounds_ok = False
+        t_lo = bounds_raw.get("min")
+        t_hi = bounds_raw.get("max")
+        if not _is_int(t_lo):
+            _err(fields, "thermal_compensation.temperature_delta_bounds.min", "must be an integer")
+            bounds_ok = False
+        if not _is_int(t_hi):
+            _err(fields, "thermal_compensation.temperature_delta_bounds.max", "must be an integer")
+            bounds_ok = False
+        if bounds_ok and t_lo > t_hi:
+            _err(
+                fields,
+                "thermal_compensation.temperature_delta_bounds",
+                "min must be less than or equal to max",
+            )
+            bounds_ok = False
+        if bounds_ok and t_hi - t_lo > MAX_TEMPERATURE_SPAN:
+            _err(
+                fields,
+                "thermal_compensation.temperature_delta_bounds",
+                f"closed interval span must not exceed {MAX_TEMPERATURE_SPAN}"
+                f" (got {t_hi - t_lo})",
+            )
+            bounds_ok = False
+    if coeff_ok and bounds_ok and coefficients is not None:
+        assert t_lo is not None and t_hi is not None
+        return ThermalCompensation(coefficients=coefficients, t_min=t_lo, t_max=t_hi)
+    return None
+
+
+def validate(
+    payload: object,
+) -> tuple[list[int], int, int, list[Window], ThermalCompensation | None]:
     """校验并归一化输入；非法时抛 ValidationErrors。"""
     fields: list[dict[str, str]] = []
     if not isinstance(payload, dict):
@@ -212,10 +339,11 @@ def validate(payload: object) -> tuple[list[int], int, int, list[Window]]:
     bounds = _validate_strain_bounds(payload, fields)
     n = len(lengths) if lengths is not None else None
     windows = _validate_windows(payload, n, fields)
+    thermal = _validate_thermal(payload, n, fields)
     if fields:
         raise ValidationErrors(fields)
     assert lengths is not None and bounds is not None and windows is not None
-    return lengths, bounds[0], bounds[1], windows
+    return lengths, bounds[0], bounds[1], windows, thermal
 
 
 # --------------------------------------------------------------------------- #
@@ -441,9 +569,16 @@ def _abs_sum_constraints(n: int, m: int, s_lo: int | None, s_hi: int | None) -> 
     return cons
 
 
-def invert_payload(payload: object) -> dict:
-    """完整反演，返回可直接复核的结果字典；校验失败/不可行抛对应异常。"""
-    lengths, strain_min, strain_max, windows = validate(payload)
+def _solve_mechanical(
+    lengths: list[int],
+    strain_min: int,
+    strain_max: int,
+    windows: list[Window],
+) -> tuple[list[int], list[int], int, int]:
+    """求给定观测窗下机械应变的三级最优解。
+
+    输入合法但无任何可行机械序列时抛 InfeasibleError。
+    """
     n = len(lengths)
     window_cons = _window_constraints(n, lengths, windows)
 
@@ -524,7 +659,201 @@ def invert_payload(payload: object) -> dict:
         x_lo, x_hi = narrowed
 
     diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
-    return _build_result(lengths, windows, strains, diffs, best_m, best_s)
+    return strains, diffs, best_m, best_s
+
+
+def _shift_windows_for_temperature(
+    windows: list[Window], weighted_coeff: list[int], t: int
+) -> list[Window]:
+    """窗 [lo,hi] 扣除热贡献 t·C_w 后得到机械加权和的闭区间。"""
+    return [
+        Window(
+            start=win.start,
+            end=win.end,
+            lo=win.lo - t * weighted_coeff[idx],
+            hi=win.hi - t * weighted_coeff[idx],
+        )
+        for idx, win in enumerate(windows)
+    ]
+
+
+def _solve_joint_thermal(
+    lengths: list[int],
+    strain_min: int,
+    strain_max: int,
+    windows: list[Window],
+    thermal: ThermalCompensation,
+    weighted_coeff: list[int],
+) -> tuple[list[int], list[int], int, int, int]:
+    """在全部允许温变上联合取得 (M, S, x, t) 字典序最优。
+
+    温变集合是隐式析取：阈值判定 = 是否存在某个候选温变可行。候选温变始终
+    按升序探测，末级平局（三级完全相同）自然落在较小温变上。
+    无任何联合可行解释时抛 InfeasibleError。
+    """
+    n = len(lengths)
+    temperatures = list(range(thermal.t_min, thermal.t_max + 1))
+    full_range = strain_max - strain_min
+
+    # 每个温变：窗界平移、机械窗约束、前缀闭包导出的机械域，只计算一次。
+    shifted: dict[int, list[Window]] = {}
+    window_cons_cache: dict[int, list[Constraint]] = {}
+    base_bounds: dict[int, tuple[list[int], list[int]] | None] = {}
+    diff_bounds_cache: dict[tuple[int, int], tuple[list[int], list[int]] | None] = {}
+
+    for t in temperatures:
+        shifted_t = _shift_windows_for_temperature(windows, weighted_coeff, t)
+        shifted[t] = shifted_t
+        window_cons_cache[t] = _window_constraints(n, lengths, shifted_t)
+        closure = _prefix_closure(n, lengths, strain_min, strain_max, shifted_t)
+        if closure is None:
+            base_bounds[t] = None
+        else:
+            base_bounds[t] = _x_bounds_from_prefix(
+                n, lengths, strain_min, strain_max, closure
+            )
+
+    def diff_bounds(t: int, m: int) -> tuple[list[int], list[int]] | None:
+        key = (t, m)
+        if key not in diff_bounds_cache:
+            bounds0 = base_bounds[t]
+            diff_bounds_cache[key] = (
+                None if bounds0 is None else _x_diff_closure(n, bounds0[0], bounds0[1], m)
+            )
+        return diff_bounds_cache[key]
+
+    def probe(
+        candidates: list[int],
+        m: int,
+        s_hi: int | None = None,
+        pins: list[tuple[int, int]] | None = None,
+        cap: tuple[int, int] | None = None,
+    ) -> int | None:
+        """候选温变（按列表顺序）中是否存在可行者；返回首个可行温变。
+
+        pins：已钉死的前段变量等式 (var, value)；cap：x_var <= value 的
+        字典序钉压（与 pins 分开，保证可行性关于 cap 阈值单调）。
+        """
+        for t in candidates:
+            narrowed = diff_bounds(t, m)
+            if narrowed is None:
+                continue
+            x_lo, x_hi = list(narrowed[0]), list(narrowed[1])
+            constraints = list(window_cons_cache[t])
+            constraints += _diff_constraints(n, m)
+            if s_hi is not None:
+                x_lo += [0] * (n - 1)
+                x_hi += [m] * (n - 1)
+                constraints += _abs_sum_constraints(n, m, None, s_hi)
+            if pins:
+                for var, value in pins:
+                    x_lo[var] = x_hi[var] = value
+                    constraints.append((((var, 1),), value, value))
+            if cap is not None:
+                var, value = cap
+                constraints.append((((var, 1),), None, value))
+            if _search(x_lo, x_hi, constraints) is not None:
+                return t
+        return None
+
+    # 阶段 0：任一温变在 M=全量程下可行？
+    if probe(temperatures, full_range) is None:
+        raise InfeasibleError(
+            "no joint (mechanical strain, common temperature delta) assignment "
+            "satisfies all observation windows within the submitted bounds"
+        )
+
+    # 阶段 1：联合二分最小 M（阈值可行 = 存在某个温变可行）。
+    m_lo, m_hi = 0, full_range
+    while m_lo < m_hi:
+        mid = (m_lo + m_hi) // 2
+        if probe(temperatures, mid) is not None:
+            m_hi = mid
+        else:
+            m_lo = mid + 1
+    best_m = m_lo
+
+    # M* 下幸存的温变（升序）。
+    candidates = [t for t in temperatures if probe([t], best_m) is not None]
+    assert candidates
+
+    # 阶段 2：联合二分最小 S = Σ|Δ_k|。
+    s_lo, s_hi = 0, (n - 1) * best_m
+    while s_lo < s_hi:
+        mid = (s_lo + s_hi) // 2
+        if probe(candidates, best_m, s_hi=mid) is not None:
+            s_hi = mid
+        else:
+            s_lo = mid + 1
+    best_s = s_lo
+    candidates = [
+        t for t in candidates if probe([t], best_m, s_hi=best_s) is not None
+    ]
+    assert candidates
+
+    # 阶段 3：在幸存温变集合上联合钉死机械序列字典序最小值。
+    # 每段探针区间取各温变 |Δ|<=M 域的并集；钉压可行阈值由二分钉死，
+    # 随后裁掉与已选前缀不相容的温变。
+    pinned: list[tuple[int, int]] = []
+    strains: list[int] = []
+    for var in range(n):
+        union_lo = min(diff_bounds(t, best_m)[0][var] for t in candidates)
+        union_hi = max(diff_bounds(t, best_m)[1][var] for t in candidates)
+        t_lo, t_hi = union_lo, union_hi
+        while t_lo < t_hi:
+            mid = (t_lo + t_hi) // 2
+            if (
+                probe(candidates, best_m, s_hi=best_s, pins=pinned, cap=(var, mid))
+                is not None
+            ):
+                t_hi = mid
+            else:
+                t_lo = mid + 1
+        strains.append(t_lo)
+        pinned.append((var, t_lo))
+        candidates = [
+            t
+            for t in candidates
+            if probe([t], best_m, s_hi=best_s, pins=pinned) is not None
+        ]
+        assert candidates
+
+    # 整条机械序列钉死后，幸存温变中取最小者（三级完全相同的平局规则）。
+    chosen_t = candidates[0]
+    diffs = [strains[i] - strains[i - 1] for i in range(1, n)]
+    return strains, diffs, best_m, best_s, chosen_t
+
+
+def invert_payload(payload: object) -> dict:
+    """完整反演，返回可直接复核的结果字典；校验失败/不可行抛对应异常。"""
+    lengths, strain_min, strain_max, windows, thermal = validate(payload)
+
+    if thermal is None:
+        # 旧模式：请求/响应/裁决/失败语义完全不变。
+        strains, diffs, best_m, best_s = _solve_mechanical(
+            lengths, strain_min, strain_max, windows
+        )
+        return _build_result(lengths, windows, strains, diffs, best_m, best_s)
+
+    # 热补偿：C_w = Σ_{i=s..e} L_i·c_i，窗内总加权和 = 机械和 + t·C_w。
+    weighted_coeff = [
+        sum(lengths[i] * thermal.coefficients[i] for i in range(win.start, win.end + 1))
+        for win in windows
+    ]
+    strains, diffs, best_m, best_s, chosen_t = _solve_joint_thermal(
+        lengths, strain_min, strain_max, windows, thermal, weighted_coeff
+    )
+    return _build_result(
+        lengths,
+        windows,
+        strains,
+        diffs,
+        best_m,
+        best_s,
+        thermal=thermal,
+        temperature_delta=chosen_t,
+        weighted_coeff=weighted_coeff,
+    )
 
 
 def _build_result(
@@ -534,6 +863,9 @@ def _build_result(
     diffs: list[int],
     best_m: int,
     best_s: int,
+    thermal: ThermalCompensation | None = None,
+    temperature_delta: int | None = None,
+    weighted_coeff: list[int] | None = None,
 ) -> dict:
     prefix = [0]
     for length in lengths:
@@ -544,23 +876,33 @@ def _build_result(
         for i in range(win.start, win.end + 1):
             weighted_sum += lengths[i] * strains[i]
         total_length = prefix[win.end + 1] - prefix[win.start]
-        window_checks.append(
-            {
-                "index": idx,
-                "start_segment": win.start + 1,
-                "end_segment": win.end + 1,
-                "total_length": total_length,
-                "min_elongation": win.lo,
-                "max_elongation": win.hi,
-                "weighted_strain_sum": weighted_sum,
-                "satisfied": win.lo <= weighted_sum <= win.hi,
-            }
-        )
+        check = {
+            "index": idx,
+            "start_segment": win.start + 1,
+            "end_segment": win.end + 1,
+            "total_length": total_length,
+            "min_elongation": win.lo,
+            "max_elongation": win.hi,
+            "weighted_strain_sum": weighted_sum,
+            "satisfied": win.lo <= weighted_sum <= win.hi,
+        }
+        if thermal is not None:
+            assert temperature_delta is not None and weighted_coeff is not None
+            # 启用热补偿时窗界已扣除热贡献；这里把热贡献加回，逐项分列以便复核：
+            #   总回算和 = 机械贡献 + 热贡献（= t·Σ_{窗内} L_i·c_i）
+            thermal_sum = temperature_delta * weighted_coeff[idx]
+            observed_total = weighted_sum + thermal_sum
+            check["mechanical_weighted_sum"] = weighted_sum
+            check["weighted_coefficient_sum"] = weighted_coeff[idx]
+            check["thermal_weighted_sum"] = thermal_sum
+            check["weighted_strain_sum"] = observed_total
+            check["satisfied"] = win.lo <= observed_total <= win.hi
+        window_checks.append(check)
     # 两级平滑指标均由相邻差直接复核（重算以自证，不直接采用搜索内部值）。
     recomputed_m = max(abs(d) for d in diffs)
     recomputed_s = sum(abs(d) for d in diffs)
     assert recomputed_m == best_m and recomputed_s == best_s
-    return {
+    result = {
         "segment_count": len(lengths),
         "strains": strains,
         "adjacent_diffs": diffs,
@@ -575,3 +917,12 @@ def _build_result(
             "lexicographic",
         ],
     }
+    if thermal is not None:
+        # strains/adjacent_diffs/两级指标均只描述机械应变；
+        # 热贡献由所选共同温变与提交系数、段长即可独立复算。
+        result["thermal_compensation"] = {
+            "temperature_delta": temperature_delta,
+            "coefficients": list(thermal.coefficients),
+            "temperature_delta_bounds": {"min": thermal.t_min, "max": thermal.t_max},
+        }
+    return result

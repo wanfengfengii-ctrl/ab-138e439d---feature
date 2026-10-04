@@ -40,22 +40,40 @@ async def schema_hint() -> dict:
                 }
             ],
             "window_count": "8..20",
+            "thermal_compensation": "(可选；省略时保持旧语义) 共同温变热补偿",
+            "thermal_compensation_detail": {
+                "coefficients": "逐段非负整数热系数 c_i，数量必须等于段数；"
+                "窗内热贡献 = t · Σ_{窗内} L_i·c_i",
+                "temperature_delta_bounds": {
+                    "min": "共同整数温变闭区间下端",
+                    "max": "上端（跨度 max-min <= 20）",
+                },
+                "model": "每段总应变 = 机械应变 x_i + c_i·t；"
+                "统一应变界与两级平滑指标只约束机械应变 x_i",
+            },
         },
         "success_response": {
             "segment_count": "int",
-            "strains": "逐段整数微应变（字典序最优）",
-            "adjacent_diffs": "逐相邻段应变差，可直接复核两级平滑指标",
+            "strains": "逐段整数**机械**微应变（三级字典序最优）",
+            "adjacent_diffs": "逐相邻段机械应变差，可直接复核两级平滑指标",
             "objectives": {
                 "max_adjacent_diff": "第一级指标 = max(|adjacent_diffs|)",
                 "sum_adjacent_abs_diff": "第二级指标 = sum(|adjacent_diffs|)",
             },
             "window_checks": [
                 {
-                    "weighted_strain_sum": "= Σ 窗内长度×应变，须落入提交的闭区间",
+                    "weighted_strain_sum": "= Σ 窗内长度×总应变，须落入提交的闭区间",
                     "total_length": "= Σ 窗内段长",
                     "satisfied": "min<=weighted_strain_sum<=max",
+                    "mechanical_weighted_sum": "(仅热补偿) = Σ 窗内长度×机械应变，"
+                    "可由 strains 与 segment_lengths 直接复核",
+                    "thermal_weighted_sum": "(仅热补偿) = temperature_delta × "
+                    "weighted_coefficient_sum，可由提交 coefficients/段长复算",
+                    "weighted_coefficient_sum": "(仅热补偿) = Σ 窗内长度×热系数",
                 }
             ],
+            "thermal_compensation": "(仅启用热补偿时) 返回所选共同温变及回显的"
+            "系数与温变闭区间；三级裁决完全相同时取较小温变",
             "criteria_order": [
                 "max_adjacent_diff",
                 "sum_adjacent_abs_diff",
@@ -64,7 +82,8 @@ async def schema_hint() -> dict:
         },
         "errors": {
             "INVALID_INPUT": {"fields": [{"field": "字段路径", "message": "原因"}]},
-            "INFEASIBLE": "观测窗彼此冲突，不存在满足全部闭区间的整数应变序列",
+            "INFEASIBLE": "观测窗彼此冲突，不存在满足全部闭区间的整数应变序列"
+            "（启用热补偿时为：允许温变区间内不存在任何联合可行解释）",
         },
     }
 

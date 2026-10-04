@@ -59,6 +59,38 @@ def feasible_payload() -> dict:
     }
 
 
+def thermal_payload() -> dict:
+    """纯热胀场景：共同温变 5、系数 2，总应变 10/段，机械应变恒 0。
+
+    单段等式窗 + 窄机械应变界 [-1,1] 使唯一联合解释为 t=5、x_i=0，
+    可严格验证热胀没有被机械应变重复吸收。
+    """
+    lengths = [3, 5, 2, 4, 6, 1]
+    coeff = [2, 2, 2, 2, 2, 2]
+    t_true = 5
+    spans = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (0, 5), (0, 2)]
+    windows = []
+    for s, e in spans:
+        total = t_true * sum(lengths[i] * coeff[i] for i in range(s, e + 1))
+        windows.append(
+            {
+                "start_segment": s + 1,
+                "end_segment": e + 1,
+                "min_elongation": total,
+                "max_elongation": total,
+            }
+        )
+    return {
+        "segment_lengths": lengths,
+        "strain_bounds": {"min": -1, "max": 1},
+        "windows": windows,
+        "thermal_compensation": {
+            "coefficients": coeff,
+            "temperature_delta_bounds": {"min": 0, "max": 10},
+        },
+    }
+
+
 def main() -> None:
     print(f"smoke against {BASE}")
 
@@ -127,6 +159,86 @@ def main() -> None:
     check(status == 422, f"非法输入 -> 422 (got {status})")
     check(body.get("code") == "INVALID_INPUT", "错误码 == INVALID_INPUT")
     check(bool(body.get("fields")), "返回明确 fields 列表")
+
+    print("5) thermal compensation 成功 + 机械/热贡献分列回算")
+    thermal = thermal_payload()
+    status, body = request("POST", "/api/v1/invert", thermal)
+    check(status == 200, f"热补偿反演 -> 200 (got {status}: {body})")
+    check(body.get("code") == "OK", "热补偿响应 code == OK")
+    result = body["result"]
+    t_info = result.get("thermal_compensation")
+    check(isinstance(t_info, dict), "返回 thermal_compensation 对象")
+    chosen_t = t_info.get("temperature_delta")
+    check(chosen_t == 5, f"联合反演选出共同温变 5 (got {chosen_t})")
+    check(
+        t_info.get("coefficients") == thermal["thermal_compensation"]["coefficients"],
+        "回显逐段热系数与提交一致",
+    )
+    lengths = thermal["segment_lengths"]
+    coeff = thermal["thermal_compensation"]["coefficients"]
+    strains = result["strains"]
+    check(all(v == 0 for v in strains), "热胀被完全剥离：机械应变恒 0")
+    check(
+        result["objectives"]
+        == {"max_adjacent_diff": 0, "sum_adjacent_abs_diff": 0},
+        "机械应变两级平滑指标均为 0（热胀未被机械重复吸收）",
+    )
+    for check_item, win in zip(result["window_checks"], thermal["windows"]):
+        s = win["start_segment"] - 1
+        e = win["end_segment"] - 1
+        mech = sum(lengths[i] * strains[i] for i in range(s, e + 1))
+        c_sum = sum(lengths[i] * coeff[i] for i in range(s, e + 1))
+        heat = chosen_t * c_sum
+        check(
+            check_item["weighted_coefficient_sum"] == c_sum,
+            f"窗[{s + 1},{e + 1}] 窗内 ΣL·c = {c_sum} 可由提交数据复算",
+        )
+        check(
+            check_item["mechanical_weighted_sum"] == mech == 0,
+            f"窗[{s + 1},{e + 1}] 机械贡献 = 0",
+        )
+        check(
+            check_item["thermal_weighted_sum"] == heat,
+            f"窗[{s + 1},{e + 1}] 热贡献 = t·ΣL·c = {heat}",
+        )
+        total = mech + heat
+        check(
+            check_item["weighted_strain_sum"] == total,
+            f"窗[{s + 1},{e + 1}] 总回算和 = 机械 + 热 = {total}",
+        )
+        check(
+            win["min_elongation"] <= total <= win["max_elongation"],
+            f"窗[{s + 1},{e + 1}] 总回算和 {total} 落入提交闭区间",
+        )
+
+    print("6) thermal compensation 字段错误 -> 422")
+    bad = thermal_payload()
+    bad["thermal_compensation"]["coefficients"] = [1, 2, 3]  # 数量不符
+    status, body = request("POST", "/api/v1/invert", bad)
+    check(status == 422, f"系数数量不符 -> 422 (got {status})")
+    check(
+        any(
+            f["field"] == "thermal_compensation.coefficients"
+            for f in body.get("fields", [])
+        ),
+        "字段级错误定位到 thermal_compensation.coefficients",
+    )
+    bad = thermal_payload()
+    bad["thermal_compensation"]["temperature_delta_bounds"] = {"min": 0, "max": 21}
+    status, body = request("POST", "/api/v1/invert", bad)
+    check(status == 422, f"温变区间跨度过大 -> 422 (got {status})")
+
+    print("7) thermal compensation 合法但无联合解释 -> 409")
+    bad = thermal_payload()
+    bad["windows"][0] = {
+        "start_segment": 1,
+        "end_segment": 6,
+        "min_elongation": 10**9,
+        "max_elongation": 10**9,
+    }
+    status, body = request("POST", "/api/v1/invert", bad)
+    check(status == 409, f"联合不可行 -> 409 (got {status})")
+    check(body.get("code") == "INFEASIBLE", "错误码 == INFEASIBLE")
 
     print("ALL SMOKE CHECKS PASSED")
 
